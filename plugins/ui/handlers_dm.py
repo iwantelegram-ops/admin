@@ -24,13 +24,18 @@ from pyrogram.raw.types import (
     MessageEntityBold       as _RawBold,
 )
 
-from database import get_config, update_config, invalidate_count_cache, invalidate_admin_groups_cache
+from database import (
+    get_config, update_config, update_config_optimistic,
+    invalidate_count_cache, invalidate_admin_groups_cache,
+    register_panel_rollback_callback,
+)
 from plugins.ui.pages import (
     page_start, page_guide, page_manage, page_group_log,
     page_regex_tutorial, page_regex_list,
     page_whitelist_text, page_free_list,
-    page_cas_panel,
-    page_newscore, page_newscore_privs,
+    page_cas_panel, page_local_panel,
+    page_newscore, page_newscore_privs, page_newscore_bioadmin, page_newscore_admintitle,
+    page_newscore_autotitle,
 )
 from plugins.ui.fsm_state import (
     pending_regex_state, pending_free_state, pending_wl_state,
@@ -62,6 +67,55 @@ async def _safe_cb(cb: CallbackQuery, coro):
         print(f"[callback guard] {cb.data}: {e}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Rollback panel — dipanggil oleh panel_write_worker (database.py) saat
+#  penulisan ke DB gagal permanen. Mengoreksi tampilan panel yang sudah
+#  optimistic supaya kembali sesuai DB, + beri tahu admin lewat alert.
+# ─────────────────────────────────────────────────────────────────────────────
+async def _panel_rollback(client, kind: str, chat_id: int, key, dm_chat_id: int, dm_msg_id: int) -> None:
+    try:
+        if kind == "config":
+            # Cache sudah di-invalidate oleh worker → get_config baca ulang dari DB.
+            # key == "local"/"expiry" → toggle/durasi itu ditampilkan di
+            # sub-panel Anti-Spam Lokal, bukan panel utama (lihat cb_toggle
+            # / cb_time di handlers_dm.py).
+            if key in ("local", "expiry"):
+                text, keyboard = await page_local_panel(chat_id)
+            else:
+                text, keyboard = await page_manage(chat_id)
+        elif kind == "ns":
+            text, keyboard = await page_newscore(chat_id)
+        else:
+            return
+
+        try:
+            await client.edit_message_text(
+                dm_chat_id, dm_msg_id, text,
+                reply_markup=keyboard, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except (MessageNotModified, MessageIdInvalid, BadRequest):
+            pass
+
+        try:
+            await client.send_message(
+                dm_chat_id,
+                "⚠️ <b>Perubahan tidak tersimpan.</b>\n\n"
+                "Tombol yang baru Anda tekan gagal disimpan ke database "
+                "(kemungkinan gangguan koneksi sesaat). Tampilan panel sudah "
+                "dikembalikan ke kondisi yang sebenarnya tersimpan.\n\n"
+                "<i>Silakan coba tekan tombolnya lagi.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[_panel_rollback] {e}")
+
+
+register_panel_rollback_callback(_panel_rollback)
+
+
 def _utf16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
@@ -76,6 +130,25 @@ async def _deny_session(cb: CallbackQuery) -> None:
         "◈ Sesi DM sudah kedaluwarsa (maks. 1 jam).\n\n"
         "<i>Buka panel dari awal untuk memperbarui sesi.</i>",
         InlineKeyboardMarkup([[InlineKeyboardButton("🔙  Kembali", callback_data="admin_menu")]])
+    )
+
+
+async def _deny_change_info(cb: CallbackQuery, chat_id: int, feature_name: str = "fitur ini", back_callback: str | None = None) -> None:
+    """Tampilkan pesan penolakan saat admin tidak punya hak 'Ubah Info Grup'."""
+    await cb.answer(
+        "⛔ Hanya admin dengan hak 'Ubah Info Grup' yang bisa mengakses fitur ini.",
+        show_alert=True,
+    )
+    await safe_edit(
+        cb.message,
+        "<b>❖ AKSES DITOLAK ❖</b>\n\n"
+        f"⛔ {feature_name} hanya bisa diakses oleh admin "
+        "dengan hak <b>'Ubah Info Grup'</b>.\n\n"
+        "<i>Minta admin lain yang memiliki hak tersebut, atau owner grup, "
+        "untuk mengatur fitur ini.</i>",
+        InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🔙  Kembali", callback_data=back_callback or f"manage_{chat_id}"
+        )]])
     )
 
 
@@ -262,6 +335,18 @@ async def cb_cas_panel(client, cb: CallbackQuery):
     await safe_edit(cb.message, text, keyboard)
 
 
+@Client.on_callback_query(filters.regex(r"^local_panel_(-?\d+)$"))
+async def cb_local_panel(client, cb: CallbackQuery):
+    await cb.answer()
+    clear_all_fsm(cb.from_user.id)
+    chat_id = int(re.search(r"(-?\d+)$", cb.data).group(1))
+    user_id = cb.from_user.id
+    if not await _adm_sess.verify_admin_session(client, user_id, chat_id):
+        return await _deny_session(cb)
+    text, keyboard = await page_local_panel(chat_id)
+    await safe_edit(cb.message, text, keyboard)
+
+
 @Client.on_callback_query(filters.regex(r"^view_wl_(-?\d+)$"))
 async def cb_view_wl(client, cb: CallbackQuery):
     await cb.answer()
@@ -282,19 +367,23 @@ async def cb_view_wl(client, cb: CallbackQuery):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Callback: toggle on/off
 # ─────────────────────────────────────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^tgl_(local|global|bio_check)_(-?\d+)$"))
+@Client.on_callback_query(filters.regex(r"^tgl_(local|global|bio_check|anti_mention)_(-?\d+)$"))
 async def cb_toggle(client, cb: CallbackQuery):
-    await cb.answer("Memperbarui...")
+    await cb.answer()
     try:
-        m       = re.match(r"^tgl_(local|global|bio_check)_(-?\d+)$", cb.data)
+        m       = re.match(r"^tgl_(local|global|bio_check|anti_mention)_(-?\d+)$", cb.data)
         key     = m.group(1)
         chat_id = int(m.group(2))
         user_id = cb.from_user.id
         if not await _adm_sess.verify_admin_session(client, user_id, chat_id):
             return await _deny_session(cb)
 
+        cfg = await get_config(chat_id)
+
         # ── Khusus bio_check: cek apakah bot pemantau sudah ready di grup ────
-        if key == "bio_check":
+        # Validasi ini WAJIB ditunggu (tidak bisa optimistic) — hanya saat
+        # mau MENYALAKAN, supaya fitur tidak tampak menyala padahal belum siap.
+        if key == "bio_check" and not cfg["bio_check"]:
             from video_call import check_monitor_is_member
             monitor_ready = await check_monitor_is_member(client, chat_id)
             if not monitor_ready:
@@ -326,9 +415,16 @@ async def cb_toggle(client, cb: CallbackQuery):
                 )
                 return
 
-        cfg = await get_config(chat_id)
-        await update_config(chat_id, key, not (cfg[key] is True))
-        text, keyboard = await page_manage(chat_id)
+        # ── Optimistic: cache diupdate instan, penulisan DB diantrikan ───────
+        update_config_optimistic(
+            chat_id, key, not (cfg[key] is True),
+            dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id,
+        )
+
+        if key == "local":
+            text, keyboard = await page_local_panel(chat_id)
+        else:
+            text, keyboard = await page_manage(chat_id)
         await safe_edit(cb.message, text, keyboard)
     except Exception as e:
         print(f"[cb_toggle] {e}")
@@ -347,8 +443,12 @@ async def cb_time(client, cb: CallbackQuery):
         cfg     = await get_config(chat_id)
         current = cfg["expiry"]
         new_val = min(43200, current + 600) if action == "inc" else max(600, current - 600)
-        await update_config(chat_id, "expiry", new_val)
-        text, keyboard = await page_manage(chat_id)
+        # ── Optimistic: cache diupdate instan, penulisan DB diantrikan ───────
+        update_config_optimistic(
+            chat_id, "expiry", new_val,
+            dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id,
+        )
+        text, keyboard = await page_local_panel(chat_id)
         await safe_edit(cb.message, text, keyboard)
     except Exception as e:
         print(f"[cb_time] {e}")
@@ -568,6 +668,10 @@ async def cb_ns_panel(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_panel_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        # NewsCore (seluruh sub-menunya) hanya untuk admin dengan hak
+        # "Ubah Info Grup" (atau owner) — gate di pintu masuk utama ini.
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
         text, keyboard = await page_newscore(chat_id)
         await safe_edit(cb.message, text, keyboard)
     except Exception as e:
@@ -581,14 +685,16 @@ async def cb_ns_toggle(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_toggle_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
 
-        from database import ns_get_config, ns_update, ns_calc_next_reset
+        from database import ns_get_config, ns_update_optimistic, ns_calc_next_reset
         cfg     = await ns_get_config(chat_id)
         new_val = not cfg.get("enabled", False)
         updates = {"enabled": new_val}
         if new_val and not cfg.get("next_reset"):
             updates["next_reset"] = ns_calc_next_reset(cfg)
-        await ns_update(chat_id, updates)
+        ns_update_optimistic(chat_id, updates, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
         await cb.answer("✅ NewsCore " + ("diaktifkan!" if new_val else "dimatikan!"), show_alert=False)
         text, keyboard = await page_newscore(chat_id)
         await safe_edit(cb.message, text, keyboard)
@@ -603,6 +709,8 @@ async def cb_ns_mode(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_mode_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📆 Per N Hari",         callback_data=f"ns_setmode_day_{chat_id}")],
             [InlineKeyboardButton("📅 Per Tanggal Bulanan", callback_data=f"ns_setmode_date_{chat_id}")],
@@ -623,9 +731,11 @@ async def cb_ns_setmode(client, cb: CallbackQuery):
         chat_id = int(m.group(2))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
 
-        from database import ns_update
-        await ns_update(chat_id, {"mode": mode})
+        from database import ns_update_optimistic
+        ns_update_optimistic(chat_id, {"mode": mode}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
 
         uid = cb.from_user.id
 
@@ -672,9 +782,11 @@ async def cb_ns_setwday(client, cb: CallbackQuery):
         chat_id = int(m.group(2))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
 
-        from database import ns_update, HARI_MAP_NS
-        await ns_update(chat_id, {"reset_weekday": wday})
+        from database import ns_update_optimistic, HARI_MAP_NS
+        ns_update_optimistic(chat_id, {"reset_weekday": wday}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
 
         nama = HARI_MAP_NS.get(wday, str(wday))
         await safe_edit(
@@ -696,6 +808,8 @@ async def cb_ns_maxadmin(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_maxadmin_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
         btns = [
             [InlineKeyboardButton(f"{i} Admin", callback_data=f"ns_setmax_{i}_{chat_id}")]
             for i in [1, 2, 3]
@@ -715,8 +829,10 @@ async def cb_ns_setmax(client, cb: CallbackQuery):
         chat_id = int(m.group(2))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
-        from database import ns_update
-        await ns_update(chat_id, {"max_admins": n})
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
+        from database import ns_update_optimistic
+        ns_update_optimistic(chat_id, {"max_admins": n}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
         await cb.answer(f"✅ Kuota admin diset ke {n}", show_alert=False)
         text, keyboard = await page_newscore(chat_id)
         await safe_edit(cb.message, text, keyboard)
@@ -732,6 +848,8 @@ async def cb_ns_time(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_time_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
         await safe_edit(
             cb.message,
             "⏰ <b>Ketik jam reset NewsCore:</b>\n\n"
@@ -751,6 +869,8 @@ async def cb_ns_privs(client, cb: CallbackQuery):
         chat_id = int(re.match(r"^ns_privs_(-?\d+)$", cb.data).group(1))
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
         text, keyboard = await page_newscore_privs(chat_id)
         await safe_edit(cb.message, text, keyboard)
     except Exception as e:
@@ -769,13 +889,247 @@ async def cb_ns_priv_toggle(client, cb: CallbackQuery):
             return
         if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
             return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Pengaturan NewsCore</b>")
 
-        from database import ns_get_config, ns_update
+        from database import ns_get_config, ns_update_optimistic
         cfg   = await ns_get_config(chat_id)
         privs = dict(cfg.get("privileges", {}))
         privs[priv_key] = not privs.get(priv_key, True)
-        await ns_update(chat_id, {"privileges": privs})
+        ns_update_optimistic(chat_id, {"privileges": privs}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
         text, keyboard = await page_newscore_privs(chat_id)
         await safe_edit(cb.message, text, keyboard)
     except Exception as e:
         print(f"[cb_ns_priv_toggle] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_bioadmin_(-?\d+)$"))
+async def cb_ns_bioadmin_panel(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_bioadmin_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        # Fitur ini hanya untuk admin dengan hak "Ubah Info Grup" (atau owner).
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Bio Admin Wajib</b>", f"ns_panel_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+        _ns_fsm.pop(cb.from_user.id, None)
+        text, keyboard = await page_newscore_bioadmin(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_bioadmin_panel] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_bioadmin_set_(-?\d+)$"))
+async def cb_ns_bioadmin_set(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_bioadmin_set_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Bio Admin Wajib</b>", f"ns_bioadmin_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+
+        await safe_edit(
+            cb.message,
+            "📝 <b>BIO ADMIN WAJIB — Ketik Teks Baru</b>\n\n"
+            "Ketik teks yang wajib ada di bio admin NewsCore.\n"
+            "Teks lain di bio mereka tetap diperbolehkan, asal teks ini "
+            "ikut tercantum.\n\n"
+            "Contoh: <code>@namagrupkita</code>\n\n"
+            "<i>Atau tekan 'Kosongkan' untuk menghapus syarat ini sepenuhnya "
+            "— admin NewsCore tidak akan diwajibkan punya teks apapun di bio.</i>\n\n"
+            "<i>Ketik /batal untuk membatalkan.</i>",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Kosongkan", callback_data=f"ns_bioadmin_clear_{chat_id}")],
+                [InlineKeyboardButton("🚫 Batal", callback_data=f"ns_bioadmin_{chat_id}")],
+            ]),
+        )
+        _ns_fsm[cb.from_user.id] = {
+            "chat_id": chat_id,
+            "action":  "ns_input_bioadmin_text",
+            "step":    1,
+            "msg_id":  cb.message.id,
+        }
+    except Exception as e:
+        print(f"[cb_ns_bioadmin_set] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_bioadmin_clear_(-?\d+)$"))
+async def cb_ns_bioadmin_clear(client, cb: CallbackQuery):
+    """Kosongkan syarat Bio Admin Wajib — admin NewsCore TIDAK diwajibkan apapun di bio."""
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_bioadmin_clear_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Bio Admin Wajib</b>", f"ns_bioadmin_{chat_id}")
+
+        clear_all_fsm(cb.from_user.id)
+        _ns_fsm.pop(cb.from_user.id, None)
+
+        from database import ns_update_optimistic
+        ns_update_optimistic(chat_id, {
+            "bio_admin_text":     "",
+            "bio_admin_required": False,
+        }, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
+
+        await cb.answer("✅ Syarat bio admin wajib dikosongkan.", show_alert=False)
+        text, keyboard = await page_newscore_bioadmin(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_bioadmin_clear] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_admintitle_(-?\d+)$"))
+async def cb_ns_admintitle_panel(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_admintitle_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        # Fitur ini hanya untuk admin dengan hak "Ubah Info Grup" (atau owner).
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Titel Admin</b>", f"ns_panel_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+        _ns_fsm.pop(cb.from_user.id, None)
+        text, keyboard = await page_newscore_admintitle(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_admintitle_panel] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_admintitle_set_(-?\d+)$"))
+async def cb_ns_admintitle_set(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_admintitle_set_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Titel Admin</b>", f"ns_admintitle_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+
+        await safe_edit(
+            cb.message,
+            "🎖️ <b>TITEL ADMIN — Ketik Teks Baru</b>\n\n"
+            "Ketik titel yang akan dipasang otomatis ke admin yang diangkat "
+            "NewsCore setiap periode reset.\n\n"
+            "<i>Maksimal 16 karakter. Font unik/Unicode style didukung "
+            "(mis. 𝐕𝐈𝐏, ᴠɪᴘ).</i>\n\n"
+            "Contoh: <code>Top Member 👑</code>\n\n"
+            "<i>Ketik /batal untuk membatalkan.</i>",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Hapus Titel", callback_data=f"ns_admintitle_clear_{chat_id}")],
+                [InlineKeyboardButton("🚫 Batal", callback_data=f"ns_admintitle_{chat_id}")],
+            ]),
+        )
+        _ns_fsm[cb.from_user.id] = {
+            "chat_id": chat_id,
+            "action":  "ns_input_admintitle_text",
+            "step":    1,
+            "msg_id":  cb.message.id,
+        }
+    except Exception as e:
+        print(f"[cb_ns_admintitle_set] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_admintitle_clear_(-?\d+)$"))
+async def cb_ns_admintitle_clear(client, cb: CallbackQuery):
+    """Hapus Titel Admin — sistem kembali memakai titel default bawaan."""
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_admintitle_clear_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Titel Admin</b>", f"ns_admintitle_{chat_id}")
+
+        clear_all_fsm(cb.from_user.id)
+        _ns_fsm.pop(cb.from_user.id, None)
+
+        from database import ns_update_optimistic
+        ns_update_optimistic(chat_id, {"admin_title": ""}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
+
+        await cb.answer("✅ Titel admin dihapus, kembali ke default.", show_alert=False)
+        text, keyboard = await page_newscore_admintitle(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_admintitle_clear] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_autotitle_(-?\d+)$"))
+async def cb_ns_autotitle_panel(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_autotitle_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        # Fitur ini hanya untuk admin dengan hak "Ubah Info Grup" (atau owner).
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Auto Title Member</b>", f"ns_panel_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+        _ns_fsm.pop(cb.from_user.id, None)
+        text, keyboard = await page_newscore_autotitle(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_autotitle_panel] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_autotitle_toggle_(-?\d+)$"))
+async def cb_ns_autotitle_toggle(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_autotitle_toggle_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Auto Title Member</b>", f"ns_panel_{chat_id}")
+
+        from database import ns_get_config, ns_update_optimistic
+        cfg     = await ns_get_config(chat_id)
+        new_val = not cfg.get("auto_title_enabled", False)
+        ns_update_optimistic(chat_id, {"auto_title_enabled": new_val}, dm_chat_id=cb.message.chat.id, dm_msg_id=cb.message.id)
+        await cb.answer("✅ Auto Title Member " + ("diaktifkan!" if new_val else "dinonaktifkan!"), show_alert=False)
+        text, keyboard = await page_newscore_autotitle(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_autotitle_toggle] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_autotitle_set_(-?\d+)$"))
+async def cb_ns_autotitle_set(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_autotitle_set_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        if not await _adm_sess.has_change_info_privilege(client, cb.from_user.id, chat_id):
+            return await _deny_change_info(cb, chat_id, "<b>Auto Title Member</b>", f"ns_autotitle_{chat_id}")
+        clear_all_fsm(cb.from_user.id)
+
+        await safe_edit(
+            cb.message,
+            "🏷️ <b>AUTO TITLE MEMBER — Ketik 10 Nama</b>\n\n"
+            "Ketik <b>10 nama berurutan</b>, dipisahkan spasi.\n\n"
+            "Contoh:\n"
+            "<code>juara1 juara2 juara3 juara4 juara5 juara6 juara7 juara8 juara9 juara10</code>\n\n"
+            "<i>Urutan menentukan kelompok rank:</i>\n"
+            "<i>nama ke-1 → rank 1-5, nama ke-2 → rank 6-10, dst.</i>\n\n"
+            "<i>Boleh kurang dari 10 (sisanya tidak dapat tag), tapi tidak boleh "
+            "lebih dari 10. Tiap nama maksimal 16 karakter (batas tag Telegram), "
+            "dan tidak boleh mengandung spasi di dalam nama itu sendiri.</i>\n\n"
+            "<i>Ketik /batal untuk membatalkan.</i>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_autotitle_{chat_id}")]]),
+        )
+        _ns_fsm[cb.from_user.id] = {
+            "chat_id": chat_id,
+            "action":  "ns_input_autotitle_names",
+            "step":    1,
+            "msg_id":  cb.message.id,
+        }
+    except Exception as e:
+        print(f"[cb_ns_autotitle_set] {e}")
