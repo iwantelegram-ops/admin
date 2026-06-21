@@ -209,7 +209,7 @@ async def main_antispam_filter(client, message):
             return
 
     # 3. External mention
-    if await _is_external_mention(client, message):
+    if cfg.get("anti_mention", True) and await _is_external_mention(client, message):
         mark_message_handled(cid, mid)
         await delete_queue.put((cid, [mid]))
         asyncio.create_task(insert_group_action_log(
