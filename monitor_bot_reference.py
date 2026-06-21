@@ -124,6 +124,12 @@ _instances_lock = asyncio.Lock()
 # ── Flag: TTL index sudah dibuat ──────────────────────────────────────────────
 _ttl_index_created = False
 
+# ── Rate-limit config untuk bio-check queue ───────────────────────────────────────────────────────────────────────────────────────
+# Jeda minimum antar request GetFullUser PER INSTANCE (bot pemantau per grup).
+# Default 0.5 detik → maks ~120 req/menit per token, aman dari limit Telegram.
+_BIO_QUEUE_DELAY = float(os.environ.get("BIO_QUEUE_DELAY", 0.5))
+
+
 
 async def _ensure_ttl_index() -> None:
     """
@@ -183,6 +189,12 @@ class MonitorInstance:
         self._last_vc_checked: dict[int, float] = {}
         self._last_typing_checked: dict[int, float] = {}
 
+        # ── Bio-check queue: antrian agar request GetFullUser tidak burst ─────
+        # Item: (user_id, asyncio.Future) — worker proses 1 per 1 + jeda
+        self._bio_queue: asyncio.Queue = asyncio.Queue()
+        self._bio_queue_pending: set[int] = set()   # dedup: sedang antri/diproses
+        self._bio_worker_task: "Optional[asyncio.Task]" = None
+
     async def _restore_session(self) -> None:
         """
         Pulihkan file .session monitor ini dari MongoDB jika file lokal belum ada
@@ -234,7 +246,11 @@ class MonitorInstance:
             await self.client.start()
             await self._save_session()
             self._register_handlers()
-            print(f"[Monitor {self.chat_id}] ✅ Bot pemantau aktif.")
+            # Jalankan bio-check worker (antrian rate-limit aman)
+            self._bio_worker_task = asyncio.create_task(
+                self._bio_worker(), name=f"bio_worker_{abs(self.chat_id)}"
+            )
+            print(f"[Monitor {self.chat_id}] ✅ Bot pemantau aktif (bio worker started).")
             return True
         except Exception as e:
             print(f"[Monitor {self.chat_id}] ❌ Gagal start: {e}")
@@ -242,6 +258,13 @@ class MonitorInstance:
 
     async def stop(self) -> None:
         self._stopped = True
+        # Hentikan bio worker
+        if self._bio_worker_task and not self._bio_worker_task.done():
+            self._bio_worker_task.cancel()
+            try:
+                await self._bio_worker_task
+            except asyncio.CancelledError:
+                pass
         # Simpan session terbaru (peer cache yang sempat terbentuk) sebelum
         # client benar-benar berhenti — kalau ini dipanggil saat SIGTERM/redeploy.
         await self._save_session()
@@ -348,9 +371,118 @@ class MonitorInstance:
         print(f"[Monitor {self.chat_id}] ⚠️  Semua fallback gagal uid={user_id} — bio tidak tersedia")
         return None
 
+
+    # ── Bio-check queue worker ───────────────────────────────────────────────
+
+    async def _bio_worker(self) -> None:
+        """
+        Worker tunggal per-instance — konsumsi _bio_queue satu per satu.
+        Jeda _BIO_QUEUE_DELAY detik antar request untuk menghindari FloodWait
+        saat banyak grup ramai dan force_check_user dipanggil beruntun.
+        """
+        while not self._stopped:
+            try:
+                user_id, future = await asyncio.wait_for(
+                    self._bio_queue.get(), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                continue
+
+            try:
+                result = await self._check_and_save_impl(user_id)
+                if not future.done():
+                    future.set_result(result)
+            except Exception as e:
+                if not future.done():
+                    try:
+                        future.set_exception(e)
+                    except Exception:
+                        pass
+            finally:
+                self._bio_queue_pending.discard(user_id)
+                self._bio_queue.task_done()
+                if not self._stopped:
+                    await asyncio.sleep(_BIO_QUEUE_DELAY)
+
+    async def _enqueue_bio_check(self, user_id: int) -> "bool | None":
+        """
+        Masukkan user_id ke antrian bio-check dan tunggu hasilnya.
+        Jika user sudah dalam antrian (dedup), langsung baca DB yang ada
+        daripada antri dua kali.
+        """
+        if user_id in self._bio_queue_pending:
+            # Sudah antri — kembalikan data DB sementara (tidak menambah antrian)
+            doc = await bio_col.find_one({"chat_id": self.chat_id, "user_id": user_id})
+            return doc.get("has_link", False) if doc else None
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._bio_queue_pending.add(user_id)
+        await self._bio_queue.put((user_id, future))
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=30.0)
+        except asyncio.TimeoutError:
+            print(f"[Monitor {self.chat_id}] _enqueue timeout uid={user_id}")
+            return None
+        except Exception as e:
+            print(f"[Monitor {self.chat_id}] _enqueue error uid={user_id}: {e}")
+            return None
+
+    async def _check_and_save_impl(self, user_id: int) -> "bool | None":
+        """
+        Implementasi inti check_and_save — hanya dipanggil oleh _bio_worker.
+        Sudah dijamin tidak burst karena dijalankan satu per satu oleh worker.
+        """
+        now = time.time()
+        bio_text = await self._fetch_bio(user_id)
+        if bio_text is None:
+            return None
+
+        has_link = bool(LINK_PATTERN.search(bio_text))
+        self._last_checked[user_id] = now
+
+        try:
+            from core.ns_bio_guard import check_admin_bio_text
+            admin_bio_ok = await check_admin_bio_text(self.chat_id, user_id, bio_text)
+        except Exception as e:
+            print(f"[Monitor {self.chat_id}] gagal cek admin_bio_ok uid={user_id}: {e}")
+            admin_bio_ok = None
+
+        old_doc      = await bio_col.find_one({"chat_id": self.chat_id, "user_id": user_id})
+        old_has_link = old_doc.get("has_link") if old_doc else None
+        updated_at   = (
+            now
+            if old_has_link != has_link
+            else (old_doc.get("updated_at", now) if old_doc else now)
+        )
+        expires_at = _make_expires_at()
+
+        await bio_col.update_one(
+            {"chat_id": self.chat_id, "user_id": user_id},
+            {"$set": {
+                "chat_id":      self.chat_id,
+                "user_id":      user_id,
+                "has_link":     has_link,
+                "bio":          bio_text[:500],
+                "checked_at":   now,
+                "updated_at":   updated_at,
+                "expires_at":   expires_at,
+                "admin_bio_ok": admin_bio_ok,
+            }},
+            upsert=True,
+        )
+
+        if old_has_link != has_link:
+            status = "ADA LINK" if has_link else "HAPUS LINK"
+            print(f"[Monitor {self.chat_id}] uid={user_id} → {status} | bio: {bio_text[:80]!r}")
+
+        return has_link
+
     async def check_and_save(
         self, user_id: int, force: bool = False
-    ) -> bool | None:
+    ) -> "bool | None":
         """
         Cek bio user, simpan ke bio_profiles dengan chat_id grup ini.
 
@@ -361,6 +493,10 @@ class MonitorInstance:
         Return: True (ada link) | False (tidak) | None (gagal fetch)
         Throttle: skip jika belum BIO_RECHECK_SECS sejak cek terakhir,
                   kecuali force=True.
+
+        RATE-LIMIT SAFE: request ke Telegram API dilakukan melalui _bio_worker
+        (antrian per-instance) dengan jeda _BIO_QUEUE_DELAY antar request.
+        Tidak langsung hit API → tidak burst saat banyak grup ramai bersamaan.
         """
         now = time.time()
 
@@ -373,48 +509,8 @@ class MonitorInstance:
                 )
                 return doc.get("has_link", False) if doc else None
 
-        bio_text = await self._fetch_bio(user_id)
-        if bio_text is None:
-            return None
-
-        has_link = bool(LINK_PATTERN.search(bio_text))
-        self._last_checked[user_id] = now
-
-        old_doc      = await bio_col.find_one(
-            {"chat_id": self.chat_id, "user_id": user_id}
-        )
-        old_has_link = old_doc.get("has_link") if old_doc else None
-        updated_at   = (
-            now
-            if old_has_link != has_link
-            else (old_doc.get("updated_at", now) if old_doc else now)
-        )
-
-        # expires_at selalu diperbarui → TTL 5 menit dari cek terakhir
-        expires_at = _make_expires_at()
-
-        await bio_col.update_one(
-            {"chat_id": self.chat_id, "user_id": user_id},
-            {"$set": {
-                "chat_id":    self.chat_id,
-                "user_id":    user_id,
-                "has_link":   has_link,
-                "bio":        bio_text[:500],
-                "checked_at": now,
-                "updated_at": updated_at,
-                "expires_at": expires_at,   # ← TTL MongoDB
-            }},
-            upsert=True,
-        )
-
-        if old_has_link != has_link:
-            status = "ADA LINK" if has_link else "HAPUS LINK"
-            print(
-                f"[Monitor {self.chat_id}] uid={user_id} → {status} "
-                f"| bio: {bio_text[:80]!r}"
-            )
-
-        return has_link
+        # Lewat antrian → _bio_worker proses satu per satu + jeda
+        return await self._enqueue_bio_check(user_id)
 
     async def check_and_save_vc(self, user_id: int) -> bool | None:
         """
@@ -753,6 +849,35 @@ async def query_bio(chat_id: int, user_id: int) -> bool | None:
         return None
 
     return doc.get("has_link", False)
+
+
+async def query_admin_bio_ok(chat_id: int, user_id: int) -> bool | None:
+    """
+    Baca hasil cek "Bio Admin Wajib" (NewsCore) dari DB untuk pasangan
+    (chat_id, user_id). Ditulis bersamaan dengan has_link oleh
+    MonitorInstance.check_and_save() — lihat field admin_bio_ok.
+
+    Return:
+      True  → user adalah admin NewsCore aktif & bio memenuhi teks wajib
+      False → user adalah admin NewsCore aktif & bio TIDAK memenuhi teks wajib
+              → bot utama harus panggil core.ns_bio_guard.enforce_admin_bio()
+      None  → bukan admin NewsCore / data belum ada — tidak perlu tindakan
+    """
+    try:
+        doc = await bio_col.find_one(
+            {"chat_id": chat_id, "user_id": user_id}
+        )
+    except Exception as e:
+        print(
+            f"[MonitorQuery] Gagal query admin_bio_ok "
+            f"chat={chat_id} uid={user_id}: {e}"
+        )
+        return None
+
+    if not doc:
+        return None
+
+    return doc.get("admin_bio_ok")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

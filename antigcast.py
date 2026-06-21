@@ -32,7 +32,7 @@ _BOT_DIR = _Path(__file__).resolve().parent
 if str(_BOT_DIR) not in sys.path:
     sys.path.insert(0, str(_BOT_DIR))
 
-from database import setup_db, delete_worker, close_db, get_bot_config, save_bot_config, get_active_backend
+from database import setup_db, delete_worker, panel_write_worker, close_db, get_bot_config, save_bot_config, get_active_backend
 from admin_session import start_cleanup_task as _adm_cleanup
 from video_call import start_userbot, stop_userbot
 
@@ -678,6 +678,11 @@ async def main():
     # sudah terkoneksi saat worker pertama kali mencoba menghapus pesan.
     asyncio.create_task(delete_worker(app))
 
+    # Background task panel_write_worker — menulis ke DB hasil tombol panel
+    # (toggle, +/-, dsb) secara antri. Client diteruskan agar worker bisa
+    # mengoreksi tampilan panel di DM admin jika penulisan gagal permanen.
+    asyncio.create_task(panel_write_worker(app))
+
     try:
         # Tandai instance ini sebagai aktif di MongoDB
         await _deploy_mark_active()
@@ -701,6 +706,12 @@ async def main():
         # ── NewsCore Time-Checker Loop ────────────────────────────────────────
         from plugins.commands.newscore import newscore_checker_loop
         asyncio.create_task(newscore_checker_loop(app))
+
+        # ── NewsCore Score Buffer Flush Worker ────────────────────────────────
+        # Flush skor yang di-buffer di memory ke MongoDB secara batch,
+        # setiap NS_FLUSH_INTERVAL detik (default 10 detik).
+        from database import ns_flush_worker_loop
+        asyncio.create_task(ns_flush_worker_loop())
 
         print("🚀 Bot Antispam + Nexus AI aktif! Tekan Ctrl+C untuk berhenti.")
         await idle()

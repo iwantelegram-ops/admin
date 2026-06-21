@@ -79,10 +79,11 @@ DEFAULT_LOCAL_EXPIRY = 3600
 TZ_WIB               = timezone(timedelta(hours=7))
 
 DEFAULT_CONFIG = {
-    "local":     True,
-    "global":    True,
-    "expiry":    DEFAULT_LOCAL_EXPIRY,
-    "bio_check": False,
+    "local":        True,
+    "global":       True,
+    "expiry":       DEFAULT_LOCAL_EXPIRY,
+    "bio_check":    False,
+    "anti_mention": True,
 }
 
 # ── In-memory cache ────────────────────────────────────────────────────────────
@@ -110,6 +111,35 @@ NEXUS_COUNT_TTL = 30   # detik
 
 # ── Delete queue ───────────────────────────────────────────────────────────────
 delete_queue: asyncio.Queue = asyncio.Queue()
+
+# ── Panel write queue ──────────────────────────────────────────────────────────
+# Tujuan: tombol panel DM (toggle, +/-, dsb) terasa "ringan" — UI berubah instan
+# karena cache di-update duluan (optimistic), sedangkan penulisan ke DB yang
+# sesungguhnya diantrikan dan dieksekusi belakangan oleh satu worker tunggal,
+# dengan jeda antar-item supaya tidak membebani DB/API saat banyak grup/klik
+# bersamaan.
+#
+# Jika penulisan GAGAL PERMANEN (sudah di-retry beberapa kali, tetap gagal):
+#   1. Cache untuk chat_id tersebut di-invalidate (paksa baca ulang dari DB
+#      di klik berikutnya — otomatis dapat nilai asli, bukan nilai optimistic
+#      yang ternyata tidak pernah tersimpan).
+#   2. Jika item membawa info pesan panel asal (dm_chat_id + dm_msg_id),
+#      panggil _panel_rollback_callback (didaftarkan oleh handlers_dm.py saat
+#      startup) untuk mengoreksi tampilan panel itu + beri tahu admin.
+# Jika sukses → tidak ada apa-apa (silent), karena UI sudah benar dari awal.
+panel_write_queue: asyncio.Queue = asyncio.Queue()
+PANEL_WRITE_DELAY = 0.3   # detik — jeda antar penulisan ke DB
+PANEL_WRITE_RETRIES = 3   # percobaan ulang sebelum dianggap gagal permanen
+
+# Diisi oleh plugins/ui/handlers_dm.py via register_panel_rollback_callback().
+# Signature: async def callback(client, kind, chat_id, key, dm_chat_id, dm_msg_id) -> None
+_panel_rollback_callback = None
+
+
+def register_panel_rollback_callback(fn) -> None:
+    """Daftarkan fungsi yang dipanggil saat penulisan panel gagal permanen."""
+    global _panel_rollback_callback
+    _panel_rollback_callback = fn
 
 # ── Handled messages tracker ──────────────────────────────────────────────────
 _handled_msgs: dict[tuple[int, int], float] = {}
@@ -1294,6 +1324,34 @@ async def update_config(chat_id: int, key: str, value) -> None:
     _config_cache.pop(chat_id, None)
 
 
+def update_config_optimistic(
+    chat_id: int, key: str, value,
+    dm_chat_id: int | None = None, dm_msg_id: int | None = None,
+) -> dict:
+    """
+    Versi "ringan" dari update_config — dipakai oleh tombol panel DM.
+
+    1. Cache di-update LANGSUNG (synchronous) → panggilan get_config()
+       berikutnya (dipakai untuk render ulang panel) langsung melihat
+       nilai baru tanpa menunggu DB.
+    2. Penulisan sesungguhnya ke DB diantrikan via panel_write_queue dan
+       dieksekusi belakangan oleh panel_write_worker.
+    3. Jika dm_chat_id + dm_msg_id diisi (lokasi pesan panel di DM admin)
+       dan penulisan ternyata GAGAL PERMANEN setelah di-retry, worker akan
+       mengoreksi tampilan panel itu kembali ke nilai DB yang sebenarnya.
+
+    Return dict config terbaru (hasil optimistic) agar pemanggil bisa
+    langsung pakai untuk render tanpa query ulang.
+    """
+    now = time.monotonic()
+    hit = _config_cache.get(chat_id)
+    cfg = dict(hit[0]) if hit else dict(DEFAULT_CONFIG)
+    cfg[key] = value
+    _config_cache[chat_id] = (cfg, now)
+    enqueue_config_write(chat_id, key, value, dm_chat_id, dm_msg_id)
+    return cfg
+
+
 # ── Cached count helpers (dipakai oleh page_manage di panel DM) ───────────────
 
 async def get_regex_count(chat_id: int) -> int:
@@ -1426,6 +1484,117 @@ async def delete_worker(client) -> None:
         except Exception:
             # Cegah worker mati diam-diam akibat exception tak terduga
             await asyncio.sleep(0.5)
+
+
+async def _panel_write_attempt(kind: str, chat_id: int, key, value) -> None:
+    """Satu percobaan penulisan ke DB. Lempar exception jika gagal."""
+    if kind == "config":
+        await config_db.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"chat_id": chat_id, key: value}},
+            upsert=True,
+        )
+    elif kind == "ns":
+        await newscore_cfg_db.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"chat_id": chat_id, **value}},
+            upsert=True,
+        )
+
+
+async def panel_write_worker(client=None) -> None:
+    """
+    Worker tunggal untuk panel_write_queue.
+
+    Tombol panel DM (toggle on/off, +/- durasi, dsb) sudah mengubah cache
+    secara optimistic SEBELUM enqueue di sini — jadi worker ini hanya
+    bertugas menulis nilai final ke DB di belakang layar, dengan jeda
+    PANEL_WRITE_DELAY detik antar item agar tidak membanjiri DB/API saat
+    banyak grup atau banyak klik beruntun terjadi bersamaan.
+
+    Retry & rollback:
+      - Tiap item dicoba hingga PANEL_WRITE_RETRIES kali (jeda singkat
+        antar percobaan) sebelum dianggap GAGAL PERMANEN.
+      - Sukses (kapan pun selama masih dalam batas retry) → selesai,
+        tidak ada efek samping lain (silent), karena UI sudah benar.
+      - Gagal permanen → cache untuk chat_id itu di-invalidate (paksa
+        baca ulang dari DB di akses berikutnya), dan jika item membawa
+        lokasi pesan panel (dm_chat_id + dm_msg_id), _panel_rollback_callback
+        dipanggil untuk mengoreksi tampilan panel itu balik ke nilai DB
+        yang sebenarnya + memberi tahu admin bahwa aksinya tidak tersimpan.
+
+    Item diambil satu per satu (bukan batch) karena tiap toggle bisa
+    menyasar koleksi/skema berbeda (config_db vs newscore_cfg_db).
+    """
+    while True:
+        try:
+            item = await panel_write_queue.get()
+            kind       = item["kind"]
+            chat_id    = item["chat_id"]
+            key        = item.get("key")
+            value      = item["value"]
+            dm_chat_id = item.get("dm_chat_id")
+            dm_msg_id  = item.get("dm_msg_id")
+
+            ok = False
+            last_err = None
+            for attempt in range(1, PANEL_WRITE_RETRIES + 1):
+                try:
+                    await _panel_write_attempt(kind, chat_id, key, value)
+                    ok = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_err = e
+                    if attempt < PANEL_WRITE_RETRIES:
+                        await asyncio.sleep(0.5 * attempt)  # backoff ringan
+
+            if not ok:
+                print(f"[panel_write_worker] GAGAL PERMANEN tulis {kind} {chat_id} {key}: {last_err}")
+                # Nilai optimistic yang sempat tersimpan di cache tidak pernah
+                # benar-benar mendarat di DB — invalidate agar baca berikutnya
+                # ambil nilai asli dari DB, bukan nilai optimistic yang salah.
+                if kind == "config":
+                    _config_cache.pop(chat_id, None)
+                elif kind == "ns":
+                    _ns_config_cache.pop(chat_id, None)
+
+                if dm_chat_id and dm_msg_id and _panel_rollback_callback is not None:
+                    try:
+                        await _panel_rollback_callback(client, kind, chat_id, key, dm_chat_id, dm_msg_id)
+                    except Exception as cb_err:
+                        print(f"[panel_write_worker] rollback callback gagal: {cb_err}")
+
+            panel_write_queue.task_done()
+            await asyncio.sleep(PANEL_WRITE_DELAY)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            # Cegah worker mati diam-diam akibat exception tak terduga
+            await asyncio.sleep(0.5)
+
+
+def enqueue_config_write(
+    chat_id: int, key: str, value,
+    dm_chat_id: int | None = None, dm_msg_id: int | None = None,
+) -> None:
+    """Antrikan penulisan satu field config grup ke DB (non-blocking)."""
+    panel_write_queue.put_nowait({
+        "kind": "config", "chat_id": chat_id, "key": key, "value": value,
+        "dm_chat_id": dm_chat_id, "dm_msg_id": dm_msg_id,
+    })
+
+
+def enqueue_ns_write(
+    chat_id: int, updates: dict,
+    dm_chat_id: int | None = None, dm_msg_id: int | None = None,
+) -> None:
+    """Antrikan penulisan field(s) NewsCore config grup ke DB (non-blocking)."""
+    panel_write_queue.put_nowait({
+        "kind": "ns", "chat_id": chat_id, "key": None, "value": updates,
+        "dm_chat_id": dm_chat_id, "dm_msg_id": dm_msg_id,
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2187,6 +2356,25 @@ newscore_stats_db  = db["newscore_stats"]   # skor chat per user per grup
 newscore_admin_db  = db["newscore_admins"]  # riwayat admin aktif yang diangkat
 newscore_cfg_db    = db["newscore_config"]  # konfigurasi newscore per grup
 
+# ── Cache ns_get_current_admins ───────────────────────────────────────────────
+# ns_get_current_admins dipanggil setiap pesan dari NS admin (untuk cek apakah
+# dia boleh dihitung skornya). Tanpa cache ini = query MongoDB per pesan.
+# Cache TTL sama dengan ADMIN_TTL (120 detik) — konsisten dengan is_admin().
+# Key: chat_id, Value: (list_admins, timestamp)
+_ns_current_admins_cache: dict[int, tuple[list, float]] = {}
+_NS_ADMINS_CACHE_TTL = ADMIN_TTL  # 120 detik — ikut ADMIN_TTL agar konsisten
+
+# ── NewsCore score buffer (rate-limit aman) ───────────────────────────────────
+# Daripada langsung update_one ke MongoDB per pesan (banyak grup ramai =
+# ribuan write/menit), kita buffer skor di memory dulu lalu flush ke DB
+# secara batch setiap _NS_FLUSH_INTERVAL detik.
+# Buffer: {(chat_id, user_id): {"name": str, "delta": int}}
+# Flush worker dijalankan dari antigcast.py setelah client.start().
+import collections as _collections
+_ns_score_buffer: dict[tuple, dict] = {}
+_ns_score_buffer_lock = asyncio.Lock() if False else None  # diinisialisasi di ns_init_flush_worker
+_NS_FLUSH_INTERVAL = int(os.environ.get("NS_FLUSH_INTERVAL", 10))  # detik
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NEWSCORE — Sistem Skor Keaktifan & Admin Otomatis
@@ -2204,6 +2392,25 @@ NEWSCORE_DEFAULT = {
     "reset_minute":   59,
     "max_admins":     1,
     "next_reset":     None,
+    "bio_admin_text": "",   # Teks wajib di bio admin yang diangkat NewsCore.
+    "bio_admin_required": True,  # False = sengaja dikosongkan via tombol "Kosongkan"
+                             # → admin NewsCore TIDAK diwajibkan apapun di bio.
+                             # True + bio_admin_text kosong (default awal, belum
+                             # pernah diatur sama sekali) = dianggap wajib tapi
+                             # mustahil dipenuhi (semua admin NewsCore di-unadmin
+                             # sampai diisi ATAU sampai owner pilih "Kosongkan").
+    "admin_title": "",      # Titel custom (maks 16 karakter) yang dipasang via
+                             # set_administrator_title saat admin
+                             # diangkat NewsCore tiap periode reset. Kosong =
+                             # pakai titel default bawaan ("Top Member N 👑").
+    "auto_title_enabled": False,  # Auto Title Member: tag otomatis (via Bot API
+                             # setChatMemberTag) untuk member NON-admin berdasar
+                             # rank typing/leaderboard NewsCore, dipasang bareng
+                             # ns_do_reset(). Beda dari admin_title (itu khusus
+                             # admin yang diangkat NewsCore).
+    "auto_title_names": [],  # List hingga 10 nama tag, urut per kelompok rank
+                             # 5 besar: index 0 -> rank 1-5, index 1 -> rank 6-10,
+                             # dst. Kosong = fitur tidak aktif walau enabled=True.
     "privileges": {
         "can_delete_messages":   True,
         "can_restrict_members":  True,
@@ -2244,6 +2451,38 @@ async def ns_update(chat_id: int, updates: dict) -> None:
     _ns_config_cache.pop(chat_id, None)  # invalidasi cache panel
 
 
+def ns_update_optimistic(
+    chat_id: int, updates: dict,
+    dm_chat_id: int | None = None, dm_msg_id: int | None = None,
+) -> dict:
+    """
+    Versi "ringan" dari ns_update — dipakai oleh tombol panel NewsCore DM.
+
+    Cache di-update langsung (synchronous) supaya render ulang panel
+    instan, sedangkan penulisan ke DB diantrikan via panel_write_queue
+    dan dieksekusi belakangan oleh panel_write_worker. Jika gagal permanen
+    dan dm_chat_id/dm_msg_id diisi, panel itu akan dikoreksi otomatis.
+
+    Return dict config terbaru (hasil optimistic).
+    """
+    now = time.monotonic()
+    hit = _ns_config_cache.get(chat_id)
+    if hit:
+        cfg = {k: v for k, v in hit[0].items()}
+        cfg["privileges"] = dict(hit[0].get("privileges", NEWSCORE_DEFAULT["privileges"]))
+    else:
+        cfg = {k: v for k, v in NEWSCORE_DEFAULT.items()}
+        cfg["privileges"] = dict(NEWSCORE_DEFAULT["privileges"])
+    for k, v in updates.items():
+        if k == "privileges":
+            cfg["privileges"] = dict(v)
+        else:
+            cfg[k] = v
+    _ns_config_cache[chat_id] = (cfg, now)
+    enqueue_ns_write(chat_id, updates, dm_chat_id, dm_msg_id)
+    return cfg
+
+
 def ns_calc_next_reset(cfg: dict) -> str:
     # Pakai TZ_WIB eksplisit (bukan datetime.now() naive) agar next_reset
     # tidak meleset jika server hosting berjalan di timezone selain WIB
@@ -2281,18 +2520,90 @@ def ns_calc_next_reset(cfg: dict) -> str:
 
 
 async def ns_track_message(chat_id: int, user_id: int, user_name: str) -> None:
-    """Tambah 1 poin skor untuk user di grup."""
+    """
+    Tambah 1 poin skor untuk user di grup.
+
+    RATE-LIMIT SAFE: skor dibuffer di memory (_ns_score_buffer) dan di-flush
+    ke MongoDB secara batch setiap _NS_FLUSH_INTERVAL detik oleh
+    ns_flush_score_buffer(). Ini menghindari ribuan update_one per menit
+    saat banyak grup ramai — DB hanya kena hit saat flush.
+    """
+    key = (chat_id, user_id)
+    if key in _ns_score_buffer:
+        _ns_score_buffer[key]["delta"] += 1
+        _ns_score_buffer[key]["name"]   = user_name  # update nama terbaru
+    else:
+        _ns_score_buffer[key] = {"name": user_name, "delta": 1}
+
+
+async def ns_flush_score_buffer() -> None:
+    """
+    Flush buffer skor ke MongoDB secara batch.
+    Dipanggil oleh background worker (ns_flush_worker_loop) setiap
+    _NS_FLUSH_INTERVAL detik. Juga dipanggil sebelum ns_reset_scores()
+    agar tidak ada skor yang hilang saat reset tiba.
+    """
+    if not _ns_score_buffer:
+        return
+
+    # Ambil snapshot lalu bersihkan buffer (tidak ada asyncio.Lock di sini
+    # karena single-threaded event loop — swap atomik cukup)
+    snapshot = dict(_ns_score_buffer)
+    _ns_score_buffer.clear()
+
+    from motor.motor_asyncio import AsyncIOMotorClientSession  # noqa (hanya untuk type hint)
+    ops = []
     try:
-        await newscore_stats_db.update_one(
-            {"chat_id": chat_id, "user_id": user_id},
-            {"$set":  {"user_name": user_name}, "$inc": {"score": 1}},
-            upsert=True,
-        )
+        from pymongo import UpdateOne
+        for (chat_id, user_id), data in snapshot.items():
+            ops.append(UpdateOne(
+                {"chat_id": chat_id, "user_id": user_id},
+                {"$set":  {"user_name": data["name"]}, "$inc": {"score": data["delta"]}},
+                upsert=True,
+            ))
+        if ops:
+            await newscore_stats_db._col.bulk_write(ops, ordered=False)  # type: ignore[attr-defined]
+    except AttributeError:
+        # Fallback jika newscore_stats_db bukan Motor collection (SQLite backend)
+        for (chat_id, user_id), data in snapshot.items():
+            try:
+                await newscore_stats_db.update_one(
+                    {"chat_id": chat_id, "user_id": user_id},
+                    {"$set":  {"user_name": data["name"]}, "$inc": {"score": data["delta"]}},
+                    upsert=True,
+                )
+            except Exception as e:
+                print(f"[NewsCore] flush fallback error: {e}")
     except Exception as e:
-        print(f"[NewsCore] track error: {e}")
+        print(f"[NewsCore] flush error: {e}")
+        # Kembalikan data ke buffer agar tidak hilang
+        for key, data in snapshot.items():
+            if key in _ns_score_buffer:
+                _ns_score_buffer[key]["delta"] += data["delta"]
+            else:
+                _ns_score_buffer[key] = data
+
+
+async def ns_flush_worker_loop() -> None:
+    """
+    Background worker: flush score buffer ke DB setiap _NS_FLUSH_INTERVAL detik.
+    Jalankan sekali dari antigcast.py setelah await app.start().
+    """
+    while True:
+        await asyncio.sleep(_NS_FLUSH_INTERVAL)
+        try:
+            await ns_flush_score_buffer()
+        except Exception as e:
+            print(f"[NewsCore] flush_worker_loop error: {e}")
 
 
 async def ns_get_leaderboard(chat_id: int, limit: int = 10) -> list:
+    """
+    Ambil leaderboard skor grup dari DB.
+    Catatan: skor yang masih di buffer (_ns_score_buffer) belum termasuk.
+    Untuk akurasi penuh saat digunakan pada reset, pastikan
+    ns_flush_score_buffer() dipanggil terlebih dahulu (lihat ns_do_reset).
+    """
     try:
         cur = newscore_stats_db.find({"chat_id": chat_id}).sort("score", -1).limit(limit)
         return await cur.to_list(length=limit)
@@ -2300,18 +2611,57 @@ async def ns_get_leaderboard(chat_id: int, limit: int = 10) -> list:
         return []
 
 
-async def ns_reset_scores(chat_id: int) -> None:
+async def ns_get_active_user_count(chat_id: int) -> int:
+    """
+    Hitung total user aktif (pernah kirim pesan) dalam periode ini.
+    Termasuk yang masih di buffer belum di-flush.
+    """
     try:
+        db_count = await newscore_stats_db.count_documents({"chat_id": chat_id})
+        # Tambahkan user di buffer yang belum ada di DB
+        buf_users = {uid for (cid, uid) in _ns_score_buffer if cid == chat_id}
+        return db_count + len(buf_users)
+    except Exception:
+        return 0
+
+
+async def ns_reset_scores(chat_id: int) -> None:
+    """
+    Reset semua skor di grup. Flush buffer dulu agar tidak ada skor hilang
+    yang masih di memory saat reset dipanggil.
+    """
+    try:
+        # Flush buffer → pastikan semua skor masuk DB sebelum dihapus
+        await ns_flush_score_buffer()
         await newscore_stats_db.delete_many({"chat_id": chat_id})
     except Exception as e:
         print(f"[NewsCore] reset error: {e}")
 
 
 async def ns_get_current_admins(chat_id: int) -> list:
+    """
+    Ambil daftar admin NewsCore aktif di grup.
+    Di-cache _NS_ADMINS_CACHE_TTL detik (default 120s, sama dengan ADMIN_TTL)
+    untuk menghindari query MongoDB per pesan saat NS admin sering chat.
+    """
+    now = time.monotonic()
+    hit = _ns_current_admins_cache.get(chat_id)
+    if hit and (now - hit[1]) < _NS_ADMINS_CACHE_TTL:
+        return hit[0]
     try:
-        return await newscore_admin_db.find({"chat_id": chat_id}).to_list(length=20)
+        result = await newscore_admin_db.find({"chat_id": chat_id}).to_list(length=20)
     except Exception:
-        return []
+        result = []
+    _ns_current_admins_cache[chat_id] = (result, now)
+    return result
+
+
+def invalidate_ns_admins_cache(chat_id: int) -> None:
+    """Hapus cache ns_get_current_admins untuk grup tertentu.
+    Dipanggil setelah ns_set_current_admins() atau ns_remove_admin()
+    agar data selalu fresh setelah ada perubahan daftar admin.
+    """
+    _ns_current_admins_cache.pop(chat_id, None)
 
 
 async def ns_set_current_admins(chat_id: int, admins: list) -> None:
@@ -2319,6 +2669,32 @@ async def ns_set_current_admins(chat_id: int, admins: list) -> None:
         await newscore_admin_db.delete_many({"chat_id": chat_id})
         if admins:
             await newscore_admin_db.insert_many(admins)
+        invalidate_ns_admins_cache(chat_id)
     except Exception as e:
         print(f"[NewsCore] set admins error: {e}")
+
+
+async def ns_remove_admin(chat_id: int, user_id: int) -> None:
+    """Hapus satu admin NewsCore dari daftar admin aktif (tanpa menyentuh admin lain)."""
+    try:
+        await newscore_admin_db.delete_many({"chat_id": chat_id, "user_id": user_id})
+        invalidate_ns_admins_cache(chat_id)
+    except Exception as e:
+        print(f"[NewsCore] remove admin error: {e}")
+
+
+async def ns_remove_score(chat_id: int, user_id: int) -> None:
+    """
+    Hapus data skor user dari newscore_stats.
+    Dipanggil saat member di-adminkan paksa (bukan via NewsCore) agar
+    bot tidak mencoba meng-adminkan dia lagi di periode berikutnya.
+    Juga bersihkan dari buffer in-memory jika belum di-flush.
+    """
+    try:
+        # Hapus dari buffer in-memory (belum tentu ada di DB)
+        _ns_score_buffer.pop((chat_id, user_id), None)
+        # Hapus dari DB
+        await newscore_stats_db.delete_many({"chat_id": chat_id, "user_id": user_id})
+    except Exception as e:
+        print(f"[NewsCore] remove_score error: {e}")
 
