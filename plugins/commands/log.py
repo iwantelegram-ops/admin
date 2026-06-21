@@ -258,7 +258,7 @@ async def log_deletion_trigger(client: Client, message: Message):
 
     # External mention (mention user yang bukan anggota grup)
     # Dicek terakhir karena butuh API call — hanya jika semua kondisi lain tidak cocok
-    if not alasan:
+    if not alasan and cfg.get("anti_mention", True) is True:
         try:
             from plugins.filters.antispam import _is_external_mention
             if await _is_external_mention(client, message):
