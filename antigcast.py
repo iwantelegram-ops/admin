@@ -468,16 +468,17 @@ def run_health_check():
 async def _setup_commands():
     try:
         await app.set_bot_commands(
-            commands=[
-                BotCommand("unmutemic", "hps / priv link bio sebelum klik ini"),
+            commands=[                
                 BotCommand("antigcast", "anti spam cerdas abad ini"),
+                BotCommand("unmutemic", "hps / priv link bio dlu"),
+                BotCommand("ns_score", "papan skor member typing"),
                 BotCommand("spam", "balas pesan n masukin ke database AI"),
             ],
             scope=BotCommandScopeAllGroupChats(),
         )
         await app.set_bot_commands(
             commands=[
-                BotCommand("antigcast", "anti spam cerdas"),
+                BotCommand("start", "mulai anti-spam cerdas"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
